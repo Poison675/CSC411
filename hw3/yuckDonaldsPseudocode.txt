@@ -1,0 +1,70 @@
+Optimal_Locations = []
+Locations = [(pos=…, profit=…, ap=…), …]
+Up = locations[0].profit
+Lp = 0
+previous_location_profit = 0
+lowerBoundary = 0 (this is a position)
+upperBoundary = 0 (this is a position)
+Ap_primary = 0 (this is an index)
+Ap_secondary = 0 (this is an index)
+
+Ind = 0
+Len_locations = len(locations)
+While ind < len_locations:
+	Current_location = locations[ind]
+	Up -= current_location.profit
+	Lp += previous_location_profit
+	
+	newUpperBoundary = current_location.pos +k
+	For location in locations[ST pos > upperBoundary]:
+		If location.pos <= newUpperBoundary:
+			Up += location.profit
+		Else:
+			Break
+			
+	newLowerBoundary = current_location.pos - k
+	For location in locations[ST pos >= lowerBoundary]:
+		If location.pos < newLowerBoundary:
+			If location == ap_primary:
+				Lp = 0
+				Ap_primary = ap_secondary = ind
+				Optimal_locations.append(location)
+				Break
+			Else:
+				Lp -= location.profit
+		Else:
+			Break
+			
+	Current_location.ap = current_location.profit - Up - Lp
+	
+	If locations[ap_primary] < current_location.ap:
+		If locations[ap_secondary].loc < newLowerBoundary:
+			Optimal_locations.append(locations[ap_secondary])
+			newInd = ind
+			For newStartInd, location in enumerate(locations[ap_secondary:ind:-1]):
+				If location.pos >= locations[ap_secondary] + k:
+					newInd = newStartInd
+				Else:
+					Break
+			Locations = locations[newInd:]
+			Len_locations = len(locations)
+			Ind = 0
+			Up = current_location.profit
+			Lp = 0
+			Previous_location_profit = 0
+			lowerBoundary = 0
+			upperBoundary = 0
+			Ap_primary = 0
+			Ap_secondary = 0
+			continue (while loop next iteration)……………… Can also be done with a recursive function call with (truncated locations, optimal_locations)
+		Else:
+			Ap_secondary = ap_primary
+			Ap_primary = ind
+			
+	upperBoundary = newUpperBoundary
+	lowerBoundary = newLowerBoundary
+	Previous_location_profit = current_location.profit
+
+Optimal_locations.append(locations[ap_primary])
+
+Return optimal_locations, sum([loc.profit for loc in locations])

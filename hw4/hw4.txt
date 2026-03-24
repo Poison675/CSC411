@@ -1,0 +1,20 @@
+CSCE 411 Homework
+
+Implement the "LP-based Algorithm for m-Height Problem" in the Project file (see its Section 3 "LP-based Algorithm for m-Height Problem"). You are allowed to use AI-assisted coding, 
+existing software packages on linear programming, etc. There is no limitation on what computer language, software package or AI tools to use. However, your submitted list of m-heights 
+must use the Python language, as specified below.
+
+   A file named HW-4-n_k_m_P has been uploaded to the "Files" section in Canvas. It contains a list of 1042 elements saved using pickle.dump(), which you can open using pickle.load(). 
+Each of the 1042 elements is a list [n,k,m,P], where n=9 is an integer, k is an integer in {4, 5, 6}, m is an integer in {2, 3, ...,, n-k}, P is a 2-dimensional numpy array of k rows 
+and n-k columns. (Note that from P, we can get a systematic generator matrix G with k rows and n columns, which defines a code, and the code has its m-height. It is the m-height of 
+the code that we want to compute.)
+
+   Apply your algorithm to each of the 1042 samples in the list, and compute its m-height. Save your 1042 m-heights as a Python list of 1042 real numbers, and save that Python list as 
+a file named HW-4-mHeights using pickle.dump(). (For t=0,1,...,1041, the t-th real number in HW-4-mHeights is the m-height of the t-th element in HW-4-n_k_m_P.)
+
+   What you need to submit: (1) The code that implements the algorithm, (2) the file HW-4-mHeights.
+
+   How your submission will be graded: an m-height you submit is considered "correct" if it deviates from our ground-truth m-height by no more than 0.1% of that ground-truth m-height. 
+For every "incorrect" m-height submitted, 100/1042 point will be deducted. (Note: for the project, two files named CSCE-411-Project-sample-n_k_m_P and CSCE-411-Project-sample-mHeights 
+have been uploaded to the "Files" section in Canvas. You can use them to verify the correctness of your algorithm.) Both files (the code and the list of m-heights) should be submitted; 
+otherwise the homework will not be graded.
