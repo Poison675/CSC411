@@ -48,26 +48,55 @@ def compute_m_height(G: np.ndarray, m: int) -> float:
 
 
 # ====================== MAIN (unchanged except using the fixed evaluator) ======================
-print("Loading HW-4-n_k_m_P ...")
-with open('HW-4-n_k_m_P', 'rb') as f:
-    data = pickle.load(f)
+# print("Loading HW-4-n_k_m_P ...")
+# with open('HW-4-n_k_m_P', 'rb') as f:
+#     data = pickle.load(f)
 
-print(f"Loaded {len(data)} samples. Starting m-height computation...\n")
+# print(f"Loaded {len(data)} samples. Starting m-height computation...\n")
 
-m_heights = []
-for idx, item in enumerate(data):
-    n, k, m, P = item
-    # Build systematic generator matrix G = [I_k | P]
-    I = np.eye(k, dtype=float)
-    G = np.hstack((I, P.astype(float)))
+# m_heights = []
+# for idx, item in enumerate(data):
+#     n, k, m, P = item
+#     # Build systematic generator matrix G = [I_k | P]
+#     I = np.eye(k, dtype=float)
+#     G = np.hstack((I, P.astype(float)))
 
-    print(f"[{idx+1:4d}/{len(data)}]  n={n} k={k} m={m}  shape={G.shape}")
-    h = compute_m_height(G, m)          # ← fixed version
-    m_heights.append(h)
-    print(f"    -> m-height = {h:.10f}\n")
+#     print(f"[{idx+1:4d}/{len(data)}]  n={n} k={k} m={m}  shape={G.shape}")
+#     h = compute_m_height(G, m)          # ← fixed version
+#     m_heights.append(h)
+#     print(f"    -> m-height = {h:.10f}\n")
 
-# Save the result
-with open('HW-4-mHeightsTEMP', 'wb') as f:
-    pickle.dump(m_heights, f)
+# # Save the result
+# with open('HW-4-mHeightsTEMP', 'wb') as f:
+#     pickle.dump(m_heights, f)
 
-print("All done! File 'HW-4-mHeightsTEMP' created successfully.")
+# print("All done! File 'HW-4-mHeightsTEMP' created successfully.")
+
+if __name__ == "__main__":
+    print("Loading generatorMatrix file...")
+    with open("generatorMatrix", "rb") as f:
+        generatorMatrix = pickle.load(f)
+
+    print(f"Loaded {len(generatorMatrix)} generator matrices.\n")
+
+    mHeight = {}
+
+    # Process each stored matrix
+    for idx, (key, P) in enumerate(sorted(generatorMatrix.items()), 1):
+        n, k, m = key
+        print(f"[{idx:4d}/{len(generatorMatrix)}]  n={n} k={k} m={m}  shape={P.shape}")
+
+        # Build systematic generator matrix G = [I_k | P]
+        I = np.eye(k, dtype=float)
+        G = np.hstack((I, P.astype(float)))
+
+        h = compute_m_height(G, m)
+        mHeight[key] = float(h)
+        print(f"    -> m-height = {h:.10f}\n")
+
+    # ====================== SAVE EXACTLY AS PROJECT REQUIRES ======================
+    with open("mHeight", "wb") as f:
+        pickle.dump(mHeight, f)
+
+    print("✅ DONE! File 'mHeight' has been created with verified values.")
+    print("   You can now submit 'generatorMatrix' and 'mHeight'.")
