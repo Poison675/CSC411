@@ -117,7 +117,7 @@ def compute_m_height(G: np.ndarray, m: int, n: int, k: int) -> float:
 
 if __name__ == "__main__":
     print("Loading generatorMatrix file...")
-    with open("generatorMatrix", "rb") as f:
+    with open("generatorMatrixTEMP", "rb") as f:
         generatorMatrix = pickle.load(f)
 
     print(f"Loaded {len(generatorMatrix)} generator matrices.\n")
@@ -133,7 +133,7 @@ if __name__ == "__main__":
         I = np.eye(k, dtype=float)
         G = np.hstack((I, P.astype(float)))
 
-        h = compute_m_height(G, m)
+        h = compute_m_height(G, m, n, k)
         mHeight[key] = float(h)
         print(f"    -> m-height = {h:.10f}\n")
 

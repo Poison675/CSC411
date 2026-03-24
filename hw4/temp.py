@@ -37,6 +37,6 @@ def print_all_generator_matrices(filename: str = "generatorMatrix"):
 
 # ====================== HOW TO USE ======================
 if __name__ == "__main__":
-    print_all_generator_matrices("generatorMatrixTEMP")
+    print_all_generator_matrices("generatorMatrixOVERALL")
     # Or specify a different filename:
     # print_all_generator_matrices("generatorMatrixOVERALL")

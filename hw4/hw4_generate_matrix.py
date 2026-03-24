@@ -33,7 +33,7 @@ def _solve_lp(args):
     res = linprog(c, A_ub=A_ub, b_ub=b_ub,
                   bounds=(None, None), method='highs',
                   options={'presolve': True, 'disp': False})
-    return -res.fun if res.success else 1.0
+    return -res.fun if res.success else -1
 
 
 def compute_m_height(G: np.ndarray, m: int) -> float:
@@ -48,7 +48,7 @@ def compute_m_height(G: np.ndarray, m: int) -> float:
     tasks = [(G, j, [t for t in range(n) if t not in S])
              for S in combinations(range(n), m) for j in S]
     results = [_solve_lp(task) for task in tasks]
-    return max(max(results), 1.0)
+    return max(max(results), 0)
 
 
 # ====================== LIGHT HILL-CLIMB REFINEMENT ======================
@@ -131,8 +131,7 @@ def evaluate_candidate(args):
     Generate and evaluate one candidate matrix.
     - ALWAYS seeds with as many full k×k identity blocks as possible (num_full = r // k).
     - Remainder columns are filled from the beginning of the next identity matrix.
-    - No random perturbation is applied (clean structured seeding for ALL matrices,
-      as requested).
+    - No random perturbation is applied (clean structured seeding for ALL matrices).
     """
     k, r, m, seed = args
     np.random.seed(seed)                    # reproducible randomness

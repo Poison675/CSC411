@@ -5,7 +5,7 @@ from scipy.optimize import linprog
 import multiprocessing as mp
 import os
 
-# ====================== FIXED & CORRECT m-HEIGHT EVALUATOR ======================
+# ====================== m-HEIGHT EVALUATOR ======================
 def _solve_lp(args):
     G, j, barS = args
     c = -G[:, j]
@@ -27,37 +27,58 @@ def compute_m_height(G: np.ndarray, m: int) -> float:
     return max(max(results), 1.0)
 
 
-# ====================== TOP-LEVEL CANDIDATE EVALUATOR ======================
 def evaluate_candidate(args):
     k, r, m, seed = args
+    # Set seed for reproducibility (critical for consistent search/optimization)
+    np.random.seed(seed)
     I = np.eye(k)
     
-    # === SAFE REPEATED-IDENTITY SEEDING (your required special case) ===
-    num_full = min(m - 1, r // k) if m >= 2 else 0   # never over-allocate blocks
+    if r >= k * (m - 1):
+        # === CASE 1: r < k*(m-1) ===
+        # Replace each row of P with repeated identity matrices:
+        # For row i, place 1's at columns i, i+k, i+2k, ... (pure structured diagonal pattern)
+        # This is the "required special case" for small parity-check length relative to m.
+        P = np.zeros((k, r), dtype=int)
+        for i in range(k):
+            pos = i
+            while pos < r:
+                P[i, pos] = 1
+                pos += k
+    else:
+        # === CASE 2: r >= k*(m-1) ===
+        # Randomly seed exactly like the original snippet (normal + round to int),
+        # then apply the safe repeated-identity blocks + perturbation,
+        P = np.random.normal(0, 1.5, (k, r)).round().astype(int)
+        
+        # Fill as many full k×k identity blocks as possible (up to m-1)
+        num_full = min(m - 1, r // k) if m >= 2 else 0
+        for b in range(num_full):
+            start = b * k
+            P[:, start:start + k] = I
+        
+        # Remainder columns (cycle identity safely)
+        rem_start = num_full * k
+        rem = r - rem_start
+        if rem > 0:
+            extra_I = np.tile(I, (1, (rem // k) + 1))[:, :rem]
+            P[:, rem_start:rem_start + rem] = extra_I
+        
+        # Perturbation for diversity (exactly as in the original)
+        P += np.random.randint(-2, 3, (k, r))
     
-    P = np.random.normal(0, 1.5, (k, r)).round().astype(int)
+    # Common post-processing for both cases (ensures validity)
+    # No zero columns allowed (project requirement)
+    zero_cols = np.all(P == 0, axis=0)
+    if np.any(zero_cols):
+        P[:, zero_cols] = 1   # safe non-zero fix
     
-    # Fill as many full k×k identity blocks as possible
-    for b in range(num_full):
-        start = b * k
-        P[:, start:start + k] = I
-    
-    # Remainder columns (safe even if rem > k)
-    rem_start = num_full * k
-    rem = r - rem_start
-    if rem > 0:
-        # Cycle the identity columns safely
-        extra_I = np.tile(I, (1, (rem // k) + 1))[:, :rem]
-        P[:, rem_start:rem_start + rem] = extra_I
-
-    # Perturbation for diversity
-    P += np.random.randint(-2, 3, (k, r))
-    P = np.clip(P, -15, 15)
-    P[:, np.all(P == 0, axis=0)] = 1   # no zero columns
-
+    # Build systematic generator matrix G = [I_k | P]
     G = np.hstack((I, P.astype(float)))
+    
+    # Compute m-height
     h = compute_m_height(G, m)
     return P, h
+
 
 
 # ====================== MAIN ======================
@@ -68,10 +89,10 @@ params_list = [
 ]
 
 # Load previous best (only update if strictly better)
-if os.path.exists("generatorMatrixOVERALL"):
-    with open("generatorMatrixOVERALL", "rb") as f:
+if os.path.exists("storage/generatorMatrix"):
+    with open("storage/generatorMatrix", "rb") as f:
         generatorMatrix = pickle.load(f)
-    with open("mHeightOVERALL", "rb") as f:
+    with open("storage/mHeight", "rb") as f:
         mHeight = pickle.load(f)
     print("✅ Loaded previous best results for comparison.")
 else:
@@ -105,13 +126,9 @@ for _ in range(1):
         print(f"   Current best for {key}: {mHeight.get(key, new_h):.6f}\n")
 
 # ====================== SAVE ONLY IF IMPROVED ======================
-with open("generatorMatrixOVERALL", "wb") as f:
+with open("storage/generatorMatrix", "wb") as f:
     pickle.dump(generatorMatrix, f)
-with open("mHeightOVERALL", "wb") as f:
-    pickle.dump(mHeight, f)
-with open("generatorMatrixOptimalV2", "wb") as f:
-    pickle.dump(generatorMatrix, f)
-with open("mHeightOptimalV2", "wb") as f:
+with open("storage/mHeight", "wb") as f:
     pickle.dump(mHeight, f)
 
 print("✅ DONE!")
