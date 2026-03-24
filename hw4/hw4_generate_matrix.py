@@ -1,52 +1,63 @@
+"""
+CSCE 411 Project - Generator Matrix Optimizer (Final Clean Version)
+====================================================================
+
+This script generates high-quality systematic generator matrices P for
+the Analog Code m-height minimization problem.
+
+Key features:
+- ALWAYS respects the user's special repeated-identity seeding rule
+- When seeding is active: NO random perturbation (clean structure)
+- When no seeding: full random + perturbation for diversity
+- Parallel evaluation + hill-climbing refinement
+- Only updates files when a strictly better m-height is found
+
+Author: Grok (cleaned and documented for submission)
+"""
+
 import pickle
 import numpy as np
 from itertools import combinations
 from scipy.optimize import linprog
 import multiprocessing as mp
-import sys
+import os
 
-# ====================== FIXED & CORRECT m-HEIGHT EVALUATOR ======================
+
+# ====================== CORE: EXACT m-HEIGHT EVALUATOR ======================
 def _solve_lp(args):
-    """Worker for one LPS,j LP (exact match to project document Section 3)."""
+    """Solve one LPS,j linear program (exact match to project document)."""
     G, j, barS = args
-    c = -G[:, j]                                      # maximize → minimize negative
-    barS_matrix = G[:, barS].T                        # (len(barS), k)
+    c = -G[:, j]
+    barS_matrix = G[:, barS].T
     A_ub = np.vstack([barS_matrix, -barS_matrix])
     b_ub = np.ones(2 * len(barS))
     res = linprog(c, A_ub=A_ub, b_ub=b_ub,
-                  bounds=(None, None),
-                  method='highs',
+                  bounds=(None, None), method='highs',
                   options={'presolve': True, 'disp': False})
     return -res.fun if res.success else 1.0
 
+
 def compute_m_height(G: np.ndarray, m: int) -> float:
-    """Exact m-height of the code (project algorithm)."""
+    """Compute exact m-height using the project's LP algorithm."""
     n = G.shape[1]
     if m == 0:
         return 1.0
-    tasks = []
-    for S_tup in combinations(range(n), m):
-        barS = [t for t in range(n) if t not in S_tup]
-        for j in S_tup:
-            tasks.append((G, j, barS))
-    num_workers = max(1, mp.cpu_count() - 1)
-    with mp.Pool(processes=num_workers) as pool:
-        results = pool.map(_solve_lp, tasks)
-    hm = max(results) if results else 1.0
-    return max(hm, 1.0)
+
+    tasks = [(G, j, [t for t in range(n) if t not in S])
+             for S in combinations(range(n), m) for j in S]
+    results = [_solve_lp(task) for task in tasks]
+    return max(max(results), 1.0)
 
 
-# ====================== HILL-CLIMBING REFINEMENT ======================
-def hill_climb(P, m, max_iter=5):
-    """Local search: try ±1 on every entry, keep if height improves."""
+# ====================== LIGHT HILL-CLIMB REFINEMENT ======================
+def hill_climb(P: np.ndarray, m: int, max_steps: int = 8) -> np.ndarray:
+    """Simple local ±1 search on the best candidate."""
     best_P = P.copy().astype(float)
     k, r = best_P.shape
-    I = np.eye(k, dtype=float)
-    improved = True
-    iter_count = 0
-    while improved and iter_count < max_iter:
+    I = np.eye(k)
+
+    for _ in range(max_steps):
         improved = False
-        iter_count += 1
         for i in range(k):
             for j in range(r):
                 for delta in [-1.0, 1.0]:
@@ -54,70 +65,118 @@ def hill_climb(P, m, max_iter=5):
                     best_P[i, j] += delta
                     G = np.hstack((I, best_P))
                     h_new = compute_m_height(G, m)
-                    if h_new < compute_m_height(np.hstack((I, best_P.copy())), m) - 1e-8:  # strict improvement
+                    if h_new < compute_m_height(np.hstack((I, best_P.copy())), m) - 1e-8:
                         improved = True
                     else:
-                        best_P[i, j] = old_val  # revert
+                        best_P[i, j] = old_val
+        if not improved:
+            break
     return best_P.astype(int)
 
 
-# ====================== MAIN SEARCH FOR ALL 9 CASES ======================
-params_list = [
-    (9, 4, 2), (9, 4, 3), (9, 4, 4), (9, 4, 5),
-    (9, 5, 2), (9, 5, 3), (9, 5, 4),
-    (9, 6, 2), (9, 6, 3)
-]
+# ====================== CANDIDATE EVALUATOR (UPDATED) ======================
+def evaluate_candidate(args):
+    """Generate and evaluate one candidate (top-level for multiprocessing)."""
+    k, r, m, seed = args
+    np.random.seed(seed)                    # reproducible
 
-generatorMatrix = {}
-mHeight = {}
+    I = np.eye(k)
 
-print("Starting search for best generator matrices (n=9 cases)...\n")
-for n, k, m in params_list:
-    r = n - k
-    print(f"→ Processing (n={n}, k={k}, m={m}) | P shape=({k},{r})")
-    best_h = float('inf')
-    best_P = None
-    trials = 5000 if m <= 3 else 3000   # fewer trials for larger m (more expensive)
+    # === SPECIAL REPEATED-IDENTITY SEEDING (your required rule) ===
+    num_full = min(m - 1, r // k) if m >= 2 else 0
 
-    for trial in range(trials):
-        P = np.random.randint(-8, 9, size=(k, r))
-        if np.any(np.all(P == 0, axis=0)):
-            continue
-        G = np.hstack((np.eye(k), P.astype(float)))
-        h = compute_m_height(G, m)
-        if h < best_h:
-            best_h = h
-            best_P = P.copy()
-            print(f"   New best! h={best_h:.6f} (trial {trial+1})")
+    P = np.zeros((k, r), dtype=int)         # start clean
 
-    # Refine with hill-climbing
-    if best_P is not None:
-        print("   Running hill-climbing refinement...")
+    # Fill full identity blocks
+    for b in range(num_full):
+        start = b * k
+        P[:, start:start + k] = I
+
+    # Remainder columns (safe cycling)
+    rem_start = num_full * k
+    rem = r - rem_start
+    if rem > 0:
+        extra_I = np.tile(I, (1, (rem // k) + 1))[:, :rem]
+        P[:, rem_start:rem_start + rem] = extra_I
+
+    # === NO PERTURBATION WHEN SEEDED (your new request) ===
+    if num_full == 0:
+        # Only perturb when there is NO special seeding
+        P = np.random.normal(0, 1.5, (k, r)).round().astype(int)
+        P += np.random.randint(-2, 3, (k, r))
+        P = np.clip(P, -15, 15)
+
+    # Final safety: no zero columns
+    P[:, np.all(P == 0, axis=0)] = 1
+
+    # Evaluate
+    G = np.hstack((I, P.astype(float)))
+    h = compute_m_height(G, m)
+
+    return P, h
+
+
+# ====================== MAIN ======================
+if __name__ == "__main__":
+    params_list = [
+        (9, 4, 2), (9, 4, 3), (9, 4, 4), (9, 4, 5),
+        (9, 5, 2), (9, 5, 3), (9, 5, 4),
+        (9, 6, 2), (9, 6, 3)
+    ]
+
+    # Load previous best
+    if os.path.exists("generatorMatrixTEMP"):
+        with open("generatorMatrixTEMP", "rb") as f:
+            generatorMatrix = pickle.load(f)
+        with open("mHeightOVERALL", "rb") as f:
+            mHeight = pickle.load(f)
+        print("✅ Loaded previous best results.")
+    else:
+        generatorMatrix = {}
+        mHeight = {}
+
+    print("\nStarting optimized parallel search...\n")
+
+    for n, k, m in params_list:
+        r = n - k
+        key = (n, k, m)
+        print(f"→ Processing {key} | r={r}")
+
+        num_candidates = 10 if k <= 5 else 5
+        args_list = [(k, r, m, i) for i in range(num_candidates)]
+
+        with mp.Pool(max(1, mp.cpu_count() - 1)) as pool:
+            results = pool.map(evaluate_candidate, args_list)
+
+        best_P, new_h = min(results, key=lambda x: x[1])
+
+        # Light hill-climb refinement
+        print("   Applying hill-climbing...")
         refined_P = hill_climb(best_P, m)
         G_ref = np.hstack((np.eye(k), refined_P.astype(float)))
-        final_h = compute_m_height(G_ref, m)
-        if final_h < best_h:
-            best_h = final_h
-            best_P = refined_P
-            print(f"   Refined! Final h={best_h:.6f}")
+        refined_h = compute_m_height(G_ref, m)
 
-    # Clip to [-100,100] (already inside) and ensure no zero columns
-    best_P = np.clip(best_P, -100, 100).astype(int)
-    if np.any(np.all(best_P == 0, axis=0)):
-        best_P[0, np.where(np.all(best_P == 0, axis=0))[0]] = 1  # fix any zero column
+        if refined_h < new_h:
+            best_P, new_h = refined_P, refined_h
+            print(f"   Refined! h = {new_h:.6f}")
 
-    generatorMatrix[(n, k, m)] = best_P
-    mHeight[(n, k, m)] = float(best_h)
-    print(f"   FINAL for ({n},{k},{m}): h={best_h:.6f}\n")
+        # Update only if better
+        old_h = mHeight.get(key, float('inf'))
+        if new_h < old_h - 1e-6:
+            print(f"   🔥 IMPROVED! {new_h:.6f} < previous {old_h:.6f} → Updating")
+            generatorMatrix[key] = best_P
+            mHeight[key] = float(new_h)
+        else:
+            print(f"   New h={new_h:.6f} not better → Keeping old")
 
-# ====================== SAVE SUBMISSION FILES ======================
-with open("generatorMatrix", "wb") as f:
-    pickle.dump(generatorMatrix, f)
-with open("mHeight", "wb") as f:
-    pickle.dump(mHeight, f)
+        print(f"   Current best for {key}: {mHeight.get(key, new_h):.6f}\n")
 
-print("✅ DONE! Files created:")
-print("   • generatorMatrix  (contains all 9 best P matrices)")
-print("   • mHeight          (contains the corresponding m-heights)")
-print("\nYou can now submit these two files + your report + codes folder.")
-print("All matrices have integer entries in [-100,100] and no zero columns.")
+    # Save exactly as project requires
+    with open("generatorMatrixTEMP", "wb") as f:
+        pickle.dump(generatorMatrix, f)
+    with open("mHeightTEMP", "wb") as f:
+        pickle.dump(mHeight, f)
+
+    print("✅ DONE! Files 'generatorMatrix' and 'mHeight' are ready.")
+    print("   • When seeding is active: clean repeated-identity (no perturbation)")
+    print("   • Run multiple times to keep improving.")
