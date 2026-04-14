@@ -58,7 +58,7 @@ def print_generator_matrices():
 
         # Full G (floats, 6 decimal places, clean)
         print(f"   Full systematic G = [I_k | P]   ({k}×{n})")
-        np.set_printoptions(precision=6, suppress=True, linewidth=120, floatmode='fixed')
+        np.set_printoptions(precision=0, suppress=True, linewidth=120, floatmode='fixed')
         print(G)
         np.set_printoptions()   # reset global settings
 
