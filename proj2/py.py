@@ -1,180 +1,215 @@
+# =============================================================================
+# CSCE-411 Project: Continuous Parallel Random + Hill-Climbing Search
+# =============================================================================
+# CHANGES FROM PREVIOUS VERSION:
+#   • Continuous outer loop: cycles through ALL 9 (n,k,m) forever.
+#   • Every batch now mixes RANDOM generation + HILL-CLIMBING (perturbations
+#     from the current best P for that parameter set).
+#   • Ctrl+C now safely interrupts the ENTIRE program at any time and saves
+#     the latest best generator matrices + m-heights before exiting.
+#   • Immediate pickle updates only on strict improvement (as requested).
+#   • Pool is created once and reused for maximum efficiency.
+#
+# Usage: python search_optimal_generator.py
+# (It will keep improving forever. Press Ctrl+C to stop gracefully.)
+# =============================================================================
+
+import os
 import pickle
 import numpy as np
-from itertools import combinations
 from scipy.optimize import linprog
-import multiprocessing as mp
-import os
+from itertools import combinations
+from typing import Tuple, List, Optional
+from multiprocessing import Pool, cpu_count
+import sys
 
-# ====================== m-HEIGHT EVALUATOR ======================
-def _solve_lp(args):
-    G, j, barS = args
-    c = -G[:, j]
-    barS_matrix = G[:, barS].T
-    A_ub = np.vstack([barS_matrix, -barS_matrix])
-    b_ub = np.ones(2 * len(barS))
-    res = linprog(c, A_ub=A_ub, b_ub=b_ub,
-                  bounds=(None, None), method='highs',
-                  options={'presolve': True, 'disp': False})
-    return -res.fun if res.success else 1.0
+# =============================================================================
+# === FAST SINGLE-PROCESS m-HEIGHT (with numerical fix) ===
+# =============================================================================
+def compute_z_S_j(G: np.ndarray, S: Tuple[int, ...], j: int) -> float:
+    """Solve one LP: maximize G[:, j] @ u  s.t. -1 <= G[:, t] @ u <= 1 for t in bar{S}"""
+    k, n = G.shape
+    bar_S = [t for t in range(n) if t not in S]
+
+    c = -G[:, j].astype(np.float64)
+
+    A_ub_list: List[np.ndarray] = []
+    b_ub_list: List[float] = []
+    for t in bar_S:
+        gt = G[:, t].astype(np.float64)
+        A_ub_list.append(gt)
+        b_ub_list.append(1.0)
+        A_ub_list.append(-gt)
+        b_ub_list.append(1.0)
+
+    res = linprog(
+        c=c,
+        A_ub=np.array(A_ub_list),
+        b_ub=np.array(b_ub_list),
+        bounds=[(-1e6, 1e6)] * k,
+        method='highs',
+        options={'presolve': True, 'disp': False}
+    )
+
+    if res.success:
+        return float(-res.fun)
+    elif res.message and "unbounded" in res.message.lower():
+        return float('inf')
+    else:
+        print(f"⚠️  LP warning for S={S}, j={j}: {res.message} → returning 1.0")
+        return 1.0
 
 
-def compute_m_height(G: np.ndarray, m: int) -> float:
-    n = G.shape[1]
+def m_height(G: np.ndarray, m: int) -> float:
+    """Compute m-height h_m(C) – single-process, fully optimized."""
+    k, n = G.shape
+    if not (0 <= m < n):
+        raise ValueError(f"m must be in [0, {n-1}], got {m}")
+
     if m == 0:
         return 1.0
-    tasks = [(G, j, [t for t in range(n) if t not in S])
-             for S in combinations(range(n), m) for j in S]
-    results = [_solve_lp(task) for task in tasks]
-    return max(max(results), 1.0)
+
+    subsets = list(combinations(range(n), m))
+    max_h = 1.0
+
+    for S_tup in subsets:
+        S = tuple(S_tup)
+        for j in S:
+            z = compute_z_S_j(G, S, j)
+            if z > max_h:
+                max_h = z
+
+    return max_h
 
 
-# ====================== PERTURBATION (core of hill-climbing) ======================
-def perturb_P(P: np.ndarray, intensity: int = 2) -> np.ndarray:
-    """Small random integer perturbation + zero-column safety fix."""
-    new_P = P.copy().astype(int)
-    k, r = new_P.shape
+# =============================================================================
+# Worker: random OR hill-climb from current best
+# =============================================================================
+def worker(args):
+    """Generate/perturb one candidate and compute its m-height."""
+    n, k, m, seed, base_P = args
+    np.random.seed(seed)
 
-    # Perturb ~10% of entries (or at least 1)
-    num_perturb = max(1, (k * r) // 10)
-    for _ in range(num_perturb):
-        i = np.random.randint(0, k)
-        j = np.random.randint(0, r)
-        delta = np.random.randint(-intensity, intensity + 1)
-        new_P[i, j] += delta
-        new_P[i, j] = np.clip(new_P[i, j], -100, 100)
-
-    # Guarantee no all-zero column (project requirement)
-    zero_cols = np.all(new_P == 0, axis=0)
-    if np.any(zero_cols):
-        for col in np.where(zero_cols)[0]:
-            new_P[:, col] = np.random.randint(-3, 4, k)
-            if np.all(new_P[:, col] == 0):
-                new_P[0, col] = 1  # guaranteed non-zero
-    return new_P
-
-
-# ====================== HILL-CLIMB CANDIDATE (replaces old random evaluator) ======================
-def hill_climb_candidate(args):
-    k, r, m, seed, current_P = args
-    np.random.seed(seed)  # reproducible yet diverse climbs
-    I = np.eye(k)
-
-    # === INITIAL MATRIX (exactly mirrors original structure for fairness) ===
-    if current_P is None:
-        # No previous best → generate fresh structured/random start
-        if r >= k * (m - 1):
-            # Structured repeated-identity blocks (pure diagonal pattern)
-            P = np.zeros((k, r), dtype=int)
-            for i in range(k):
-                pos = i
-                while pos < r:
-                    P[i, pos] = 1
-                    pos += k
-        else:
-            # Random + as many full identity blocks as possible + remainder
-            P = np.random.normal(0, 1.5, (k, r)).round().astype(int)
-            num_full = min(m - 1, r // k) if m >= 2 else 0
-            for b in range(num_full):
-                start = b * k
-                P[:, start:start + k] = I
-            rem_start = num_full * k
-            rem = r - rem_start
-            if rem > 0:
-                extra_I = np.tile(I, (1, (rem // k) + 1))[:, :rem]
-                P[:, rem_start:rem_start + rem] = extra_I
-            P += np.random.randint(-2, 3, (k, r))
+    if base_P is None:
+        # Pure random candidate
+        P = np.random.randint(-100, 101, size=(k, n - k))
     else:
-        # Start from previous best (or its copy)
-        P = current_P.copy()
+        # Hill-climbing: perturb current best
+        P = base_P.copy()
+        num_perturb = np.random.randint(1, 5)          # 1–4 random entry changes
+        for _ in range(num_perturb):
+            r = np.random.randint(0, k)
+            c = np.random.randint(0, n - k)
+            delta = np.random.randint(-20, 21)         # reasonably large steps
+            P[r, c] = np.clip(P[r, c] + delta, -100, 100)
 
-    # Common safety fix
+    # Guarantee no all-zero column
     zero_cols = np.all(P == 0, axis=0)
-    if np.any(zero_cols):
-        P[:, zero_cols] = 1
+    while np.any(zero_cols):
+        P[:, zero_cols] = np.random.randint(-100, 101, size=(k, np.sum(zero_cols)))
+        zero_cols = np.all(P == 0, axis=0)
 
-    # ====================== HILL CLIMBING LOOP ======================
-    best_P = P.copy()
-    G_best = np.hstack((I, best_P.astype(float)))
-    best_h = compute_m_height(G_best, m)
+    # Build G = [I_k | P]
+    G = np.hstack((np.eye(k), P.astype(np.float64)))
 
-    no_improve = 0
-    max_steps = 300 if k <= 5 else 200          # heavy iteration budget
-    patience = 50                                   # stop early if stuck
-
-    for step in range(max_steps):
-        candidate_P = perturb_P(best_P, intensity=2)
-        G_cand = np.hstack((I, candidate_P.astype(float)))
-        new_h = compute_m_height(G_cand, m)
-
-        if new_h < best_h - 1e-6:          # strictly better → accept
-            best_P = candidate_P
-            best_h = new_h
-            no_improve = 0
-        else:
-            no_improve += 1
-
-        if no_improve >= patience:
-            break
-
-    return best_P, best_h
+    h = m_height(G, m)
+    return P, h
 
 
-# ====================== MAIN (structure preserved + hill-climbing) ======================
-params_list = [
-    (9, 4, 2), (9, 4, 3), (9, 4, 4), (9, 4, 5),
-    (9, 5, 2), (9, 5, 3), (9, 5, 4),
-    (9, 6, 2), (9, 6, 3)
-]
+# =============================================================================
+# Main continuous search with safe Ctrl+C exit
+# =============================================================================
+if __name__ == "__main__":
+    gen_file = "generatorMatrixTemp"
+    mh_file = "mHeightTemp"
 
-# Load previous best results (only improve if strictly better)
-if os.path.exists("generatorMatrix"):
-    with open("generatorMatrix", "rb") as f:
-        generatorMatrix = pickle.load(f)
-    with open("mHeight", "rb") as f:
-        mHeight = pickle.load(f)
-    print("✅ Loaded previous best results for comparison.")
-else:
-    generatorMatrix = {}
-    mHeight = {}
+    # Load previous best results (or start fresh)
+    if os.path.exists(gen_file):
+        with open(gen_file, "rb") as f:
+            generator_dict = pickle.load(f)
+        print(f"✅ Loaded existing generatorMatrix ({len(generator_dict)} entries)")
+    else:
+        generator_dict = {}
+        print("ℹ️  No generatorMatrix found → starting fresh")
 
-print("\n🚀 Starting hill-climbing search (10 full iterations)...\n")
+    if os.path.exists(mh_file):
+        with open(mh_file, "rb") as f:
+            mHeight_dict = pickle.load(f)
+        print(f"✅ Loaded existing mHeight ({len(mHeight_dict)} entries)")
+    else:
+        mHeight_dict = {}
+        print("ℹ️  No mHeight found → starting fresh")
 
-for iteration in range(10):                     # heavy outer iteration
-    print(f"=== GLOBAL ITERATION {iteration + 1}/10 ===")
-    for n, k, m in params_list:
-        r = n - k
-        key = (n, k, m)
-        print(f"→ Processing {key} | r={r} | climbing from current best...")
+    # All required parameter sets
+    params = [
+        (9, 4, 2), (9, 4, 3), (9, 4, 4), (9, 4, 5),
+        (9, 5, 2), (9, 5, 3), (9, 5, 4),
+        (9, 6, 2), (9, 6, 3),
+    ]
 
-        # Start from previous best (if any) or fresh structured random
-        current_P = generatorMatrix.get(key)   # None if first time
+    num_workers = cpu_count()
+    batch_size = num_workers * 8          # high throughput
+    print(f"🚀 Starting continuous parallel search with {num_workers} cores")
+    print(f"   Batch size = {batch_size} candidates per parameter set (random + hill-climbing)")
 
-        num_candidates = 30 if k <= 5 else 15   # parallel climbs (each does heavy local search)
-        args_list = [(k, r, m, i, current_P) for i in range(num_candidates)]
+    trial_counter = 0
 
-        with mp.Pool(max(1, mp.cpu_count() - 1)) as pool:
-            results = pool.map(hill_climb_candidate, args_list)
+    with Pool(processes=num_workers) as pool:
+        try:
+            while True:                                      # ← continuous forever
+                for n, k, m in params:
+                    key = (n, k, m)
+                    current_best_h = mHeight_dict.get(key, float("inf"))
+                    current_best_P = generator_dict.get(key)
 
-        # Best climb from this batch
-        best_P, new_h = min(results, key=lambda x: x[1])
+                    print(f"\n🔄 Batch {trial_counter:,} | {n},{k},{m} | best so far = {current_best_h:.8f}")
 
-        old_h = mHeight.get(key, float('inf'))
-        if new_h < old_h - 1e-6:
-            print(f"   🔥 IMPROVED! {new_h:.6f} < previous {old_h:.6f} → Updating")
-            generatorMatrix[key] = best_P
-            mHeight[key] = float(new_h)
-        else:
-            print(f"   Best climb h={new_h:.6f} (no improvement over {old_h:.6f}) → Keeping old")
+                    # Decide how many hill-climb vs random (bias toward hill-climb once we have a good matrix)
+                    hill_prob = 0.65 if current_best_P is not None else 0.0
 
-        print(f"   Current best for {key}: {mHeight.get(key, new_h):.6f}\n")
+                    args_list = []
+                    for i in range(batch_size):
+                        seed = trial_counter * batch_size + i
+                        if np.random.rand() < hill_prob:
+                            base_P = current_best_P.copy()
+                        else:
+                            base_P = None
+                        args_list.append((n, k, m, seed, base_P))
 
-# ====================== SAVE (always write latest bests) ======================
-with open("generatorMatrix", "wb") as f:
-    pickle.dump(generatorMatrix, f)
-with open("mHeight", "wb") as f:
-    pickle.dump(mHeight, f)
+                    # PARALLEL evaluation
+                    results = pool.map(worker, args_list)
 
-print("✅ DONE! Generator matrices & m-heights saved.")
-print("   • Repeated-identity structure + heavy hill-climbing used.")
-print("   • Run this script again (or increase range(10)) to keep improving further.")
-print("   • Files 'generatorMatrix' and 'mHeight' are ready for submission.")
+                    improved = False
+                    for P_cand, h_cand in results:
+                        if 1.0 <= h_cand < current_best_h:   # strictly better
+                            current_best_h = h_cand
+                            current_best_P = P_cand.copy()
+                            generator_dict[key] = current_best_P
+                            mHeight_dict[key] = current_best_h
+
+                            # Immediate save
+                            with open(gen_file, "wb") as f:
+                                pickle.dump(generator_dict, f)
+                            with open(mh_file, "wb") as f:
+                                pickle.dump(mHeight_dict, f)
+
+                            print(f"🎉 NEW BEST for {key} → h_m = {current_best_h:.8f}")
+                            improved = True
+
+                    if improved:
+                        print(f"   → Pickles updated with improved matrix for {key}")
+
+                    trial_counter += 1
+
+        except KeyboardInterrupt:
+            print("\n\n🛑 Ctrl+C received – saving current best results before exit...")
+            # Final save (in case the very last batch had no improvement)
+            with open(gen_file, "wb") as f:
+                pickle.dump(generator_dict, f)
+            with open(mh_file, "wb") as f:
+                pickle.dump(mHeight_dict, f)
+            print("✅ All best generator matrices and m-heights saved.")
+            print("   You can restart the script anytime – it will resume from these bests.")
+            sys.exit(0)
+
+    # (This line is unreachable because of the infinite loop + Ctrl+C handler)
