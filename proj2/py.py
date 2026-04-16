@@ -12,60 +12,25 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 # === m-HEIGHT CORE ==========================================
 # ============================================================
 
-def compute_z_S_j(G: np.ndarray, S: Tuple[int, ...], j: int) -> float:
-    """Solve one LP: maximize G[:, j] @ u  s.t. -1 <= G[:, t] @ u <= 1 for t in bar{S}."""
-    k, n = G.shape
-    bar_S = [t for t in range(n) if t not in S]
-
-    c = -G[:, j].astype(np.float64)
-
-    A_ub_list: List[np.ndarray] = []
-    b_ub_list: List[float] = []
-    for t in bar_S:
-        gt = G[:, t].astype(np.float64)
-        A_ub_list.append(gt)
-        b_ub_list.append(1.0)
-        A_ub_list.append(-gt)
-        b_ub_list.append(1.0)
-
-    res = linprog(
-        c=c,
-        A_ub=np.array(A_ub_list),
-        b_ub=np.array(b_ub_list),
-        bounds=[(-1e6, 1e6)] * k,
-        method='highs',
-        options={'presolve': True, 'disp': False}
-    )
-
-    if res.success:
-        return float(-res.fun)
-    elif res.message and "unbounded" in res.message.lower():
-        return float('inf')
-    else:
-        print(f"  LP warning for S={S}, j={j}: {res.message} → returning 1.0")
-        return 1.0
-
+def _solve_lp(args):
+    G, j, barS = args
+    c = -G[:, j]
+    barS_matrix = G[:, barS].T
+    A_ub = np.vstack([barS_matrix, -barS_matrix])
+    b_ub = np.ones(2 * len(barS))
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub,
+                  bounds=(None, None), method='highs',
+                  options={'presolve': True, 'disp': False})
+    return -res.fun if res.success else np.inf
 
 def m_height(G: np.ndarray, m: int) -> float:
-    """Compute m-height h_m(C)."""
-    k, n = G.shape
-    if not (0 <= m < n):
-        raise ValueError(f"m must be in [0, {n-1}], got {m}")
-
+    n = G.shape[1]
     if m == 0:
         return 1.0
-
-    subsets = combinations(range(n), m)
-    max_h = 1.0
-
-    for S in subsets:
-        S = tuple(S)
-        for j in S:
-            z = compute_z_S_j(G, S, j)
-            if z > max_h:
-                max_h = z
-
-    return max_h
+    tasks = [(G, j, [t for t in range(n) if t not in S]) 
+             for S in combinations(range(n), m) for j in S]
+    results = [_solve_lp(task) for task in tasks]
+    return max(max(results), 1.0)
 
 
 # ============================================================

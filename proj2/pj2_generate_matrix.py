@@ -15,9 +15,9 @@ def _solve_lp(args):
     res = linprog(c, A_ub=A_ub, b_ub=b_ub,
                   bounds=(None, None), method='highs',
                   options={'presolve': True, 'disp': False})
-    return -res.fun if res.success else 1.0
+    return -res.fun if res.success else np.inf
 
-def compute_m_height(G: np.ndarray, m: int) -> float:
+def m_height(G: np.ndarray, m: int) -> float:
     n = G.shape[1]
     if m == 0:
         return 1.0
