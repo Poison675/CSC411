@@ -89,10 +89,10 @@ params_list = [
 ]
 
 # Load previous best (only update if strictly better)
-if os.path.exists("storage/generatorMatrix"):
-    with open("storage/generatorMatrix", "rb") as f:
+if os.path.exists("generatorMatrix"):
+    with open("generatorMatrix", "rb") as f:
         generatorMatrix = pickle.load(f)
-    with open("storage/mHeight", "rb") as f:
+    with open("mHeight", "rb") as f:
         mHeight = pickle.load(f)
     print("✅ Loaded previous best results for comparison.")
 else:
@@ -126,9 +126,9 @@ for _ in range(1):
         print(f"   Current best for {key}: {mHeight.get(key, new_h):.6f}\n")
 
 # ====================== SAVE ONLY IF IMPROVED ======================
-with open("storage/generatorMatrix", "wb") as f:
+with open("generatorMatrix", "wb") as f:
     pickle.dump(generatorMatrix, f)
-with open("storage/mHeight", "wb") as f:
+with open("mHeight", "wb") as f:
     pickle.dump(mHeight, f)
 
 print("✅ DONE!")
