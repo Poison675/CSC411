@@ -1,33 +1,19 @@
-# =============================================================================
-# CSCE-411 Project: Continuous Parallel Random + Hill-Climbing Search
-# =============================================================================
-# CHANGES FROM PREVIOUS VERSION:
-#   • Continuous outer loop: cycles through ALL 9 (n,k,m) forever.
-#   • Every batch now mixes RANDOM generation + HILL-CLIMBING (perturbations
-#     from the current best P for that parameter set).
-#   • Ctrl+C now safely interrupts the ENTIRE program at any time and saves
-#     the latest best generator matrices + m-heights before exiting.
-#   • Immediate pickle updates only on strict improvement (as requested).
-#   • Pool is created once and reused for maximum efficiency.
-#
-# Usage: python search_optimal_generator.py
-# (It will keep improving forever. Press Ctrl+C to stop gracefully.)
-# =============================================================================
-
 import os
 import pickle
+import random
+from itertools import combinations
+from typing import Dict, Tuple, List
+
 import numpy as np
 from scipy.optimize import linprog
-from itertools import combinations
-from typing import Tuple, List, Optional
-from multiprocessing import Pool, cpu_count
-import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# =============================================================================
-# === FAST SINGLE-PROCESS m-HEIGHT (with numerical fix) ===
-# =============================================================================
+# ============================================================
+# === m-HEIGHT CORE ==========================================
+# ============================================================
+
 def compute_z_S_j(G: np.ndarray, S: Tuple[int, ...], j: int) -> float:
-    """Solve one LP: maximize G[:, j] @ u  s.t. -1 <= G[:, t] @ u <= 1 for t in bar{S}"""
+    """Solve one LP: maximize G[:, j] @ u  s.t. -1 <= G[:, t] @ u <= 1 for t in bar{S}."""
     k, n = G.shape
     bar_S = [t for t in range(n) if t not in S]
 
@@ -56,12 +42,12 @@ def compute_z_S_j(G: np.ndarray, S: Tuple[int, ...], j: int) -> float:
     elif res.message and "unbounded" in res.message.lower():
         return float('inf')
     else:
-        print(f"⚠️  LP warning for S={S}, j={j}: {res.message} → returning 1.0")
+        print(f"  LP warning for S={S}, j={j}: {res.message} → returning 1.0")
         return 1.0
 
 
 def m_height(G: np.ndarray, m: int) -> float:
-    """Compute m-height h_m(C) – single-process, fully optimized."""
+    """Compute m-height h_m(C)."""
     k, n = G.shape
     if not (0 <= m < n):
         raise ValueError(f"m must be in [0, {n-1}], got {m}")
@@ -69,11 +55,11 @@ def m_height(G: np.ndarray, m: int) -> float:
     if m == 0:
         return 1.0
 
-    subsets = list(combinations(range(n), m))
+    subsets = combinations(range(n), m)
     max_h = 1.0
 
-    for S_tup in subsets:
-        S = tuple(S_tup)
+    for S in subsets:
+        S = tuple(S)
         for j in S:
             z = compute_z_S_j(G, S, j)
             if z > max_h:
@@ -82,134 +68,238 @@ def m_height(G: np.ndarray, m: int) -> float:
     return max_h
 
 
-# =============================================================================
-# Worker: random OR hill-climb from current best
-# =============================================================================
-def worker(args):
-    """Generate/perturb one candidate and compute its m-height."""
-    n, k, m, seed, base_P = args
-    np.random.seed(seed)
+# ============================================================
+# === NEW HELPER: IDENTITY-ROWS CANDIDATE ====================
+# ============================================================
 
-    if base_P is None:
-        # Pure random candidate
-        P = np.random.randint(-100, 101, size=(k, n - k))
+def create_identity_rows_P(k: int, n_minus_k: int) -> np.ndarray:
+    """
+    Create the "matrix of all identity rows" candidate:
+    Each column j gets a single 1 in row (j % k). Guarantees no all-zero columns.
+    """
+    P = np.zeros((k, n_minus_k), dtype=int)
+    for col in range(n_minus_k):
+        row = col % k
+        P[row, col] = 1
+    return P
+
+
+# ============================================================
+# === NEW HELPER: PARALLEL NEIGHBOR EVALUATOR ================
+# ============================================================
+
+def evaluate_neighbor(args: tuple) -> float:
+    """Top-level worker for parallel map (must be picklable)."""
+    P_new, n, k, m = args
+    G_new = build_systematic_G(k, n, P_new)
+    return m_height(G_new, m)
+
+
+# ============================================================
+# === LOCAL IMPROVEMENT (with identity check + parallel) =====
+# ============================================================
+
+def local_improve(P: np.ndarray, n: int, k: int, m: int) -> Tuple[np.ndarray, float]:
+    """
+    1. First check the "matrix of all identity rows" candidate.
+       If it beats the current m-height, replace immediately.
+    2. Then run greedy ±1 local search, with ALL possible neighbors
+       evaluated in parallel each iteration (maximally parallel).
+    Continues until no improving single flip exists.
+    """
+    P = P.copy().astype(int)
+    current_h = m_height(build_systematic_G(k, n, P), m)
+
+    # === Step 1: Quick identity-rows candidate check ===
+    P_id = create_identity_rows_P(k, n - k)
+    h_id = m_height(build_systematic_G(k, n, P_id), m)
+    if h_id < current_h:
+        P = P_id
+        current_h = h_id
+        print(f"  Identity-rows candidate beats current: h_m = {h_id:.6g}")
+
+    # === Step 2: Parallel greedy ±1 local search ===
+    iteration = 0
+    while True:
+        iteration += 1
+        # Generate all valid single-flip neighbors
+        neighbors = []
+        for i in range(k):
+            for j in range(n - k):
+                for delta in [-3, -2, -1, 1, 2, 3]:
+                    P_new = P.copy()
+                    P_new[i, j] += delta
+                    if np.all(P_new[:, j] == 0):
+                        continue
+                    neighbors.append((P_new, n, k, m))
+
+        if not neighbors:
+            break
+
+        # Parallel evaluation of ALL neighbors
+        num_workers = min(len(neighbors), os.cpu_count() or 4)
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            h_list = list(executor.map(evaluate_neighbor, neighbors))
+
+        # Find the SINGLE best improving neighbor (greedy)
+        best_h_new = current_h
+        best_P_new = None
+        for idx, h_new in enumerate(h_list):
+            if h_new < best_h_new:
+                best_h_new = h_new
+                best_P_new = neighbors[idx][0]
+
+        if best_P_new is None:
+            break  # no improvement possible
+
+        # Accept the best flip and continue
+        P = best_P_new
+        current_h = best_h_new
+        print(f"  Local improve iter {iteration} → h_m = {current_h:.6g} (best neighbor)")
+
+    return P, current_h
+
+
+# ============================================================
+# === SEARCH SPACE & PARALLEL DRIVER =========================
+# ============================================================
+
+GEN_PICKLE = "generatorMatrixMerge"
+MH_PICKLE = "mHeightMerge"
+
+PARAMS = [
+    (9, 4, 2), (9, 4, 3), (9, 4, 4), (9, 4, 5),
+    (9, 5, 2), (9, 5, 3), (9, 5, 4),
+    (9, 6, 2), (9, 6, 3),
+]
+
+
+def load_state():
+    if os.path.exists(GEN_PICKLE):
+        with open(GEN_PICKLE, "rb") as f:
+            best_generators = pickle.load(f)
     else:
-        # Hill-climbing: perturb current best
-        P = base_P.copy()
-        num_perturb = np.random.randint(1, 5)          # 1–4 random entry changes
-        for _ in range(num_perturb):
-            r = np.random.randint(0, k)
-            c = np.random.randint(0, n - k)
-            delta = np.random.randint(-20, 21)         # reasonably large steps
-            P[r, c] = np.clip(P[r, c] + delta, -100, 100)
+        best_generators = {}
 
-    # Guarantee no all-zero column
-    zero_cols = np.all(P == 0, axis=0)
-    while np.any(zero_cols):
-        P[:, zero_cols] = np.random.randint(-100, 101, size=(k, np.sum(zero_cols)))
-        zero_cols = np.all(P == 0, axis=0)
+    if os.path.exists(MH_PICKLE):
+        with open(MH_PICKLE, "rb") as f:
+            best_mheights = pickle.load(f)
+    else:
+        best_mheights = {}
 
-    # Build G = [I_k | P]
-    G = np.hstack((np.eye(k), P.astype(np.float64)))
-
-    h = m_height(G, m)
-    return P, h
+    return best_generators, best_mheights
 
 
-# =============================================================================
-# Main continuous search with safe Ctrl+C exit
-# =============================================================================
+def save_state(best_generators, best_mheights):
+    with open(GEN_PICKLE, "wb") as f:
+        pickle.dump(best_generators, f)
+    with open(MH_PICKLE, "wb") as f:
+        pickle.dump(best_mheights, f)
+
+
+def random_P(k: int, n_minus_k: int, low: int = -5, high: int = 5) -> np.ndarray:
+    while True:
+        P = np.random.randint(low, high + 1, size=(k, n_minus_k))
+        if np.all(np.any(P != 0, axis=0)):
+            return P
+
+
+def build_systematic_G(k: int, n: int, P: np.ndarray) -> np.ndarray:
+    I = np.eye(k, dtype=float)
+    return np.concatenate([I, P.astype(float)], axis=1)
+
+
+# ============================================================
+# === WORKER FOR RANDOM SEARCH ===============================
+# ============================================================
+
+def worker_task(param: Tuple[int, int, int], num_trials: int, seed: int = None):
+    if seed is not None:
+        np.random.seed(seed)
+        random.seed(seed)
+
+    n, k, m = param
+    best_h = float("inf")
+    best_P = None
+
+    for _ in range(num_trials):
+        P = random_P(k, n - k)
+        G = build_systematic_G(k, n, P)
+        h = m_height(G, m)
+        if h < best_h:
+            best_h = h
+            best_P = P
+
+    return param, best_P, best_h
+
+
+# ============================================================
+# === MAIN ===================================================
+# ============================================================
+
+def main(
+    total_trials_per_param: int = 200,
+    workers: int = None,
+    batch_size: int = 10,
+):
+    best_generators, best_mheights = load_state()
+
+    if workers is None:
+        workers = os.cpu_count() or 4
+
+    print(f"Using {workers} worker processes for random search.")
+
+    # === RANDOM SEARCH PHASE (already parallel) ===
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = []
+        for param in PARAMS:
+            n, k, m = param
+            remaining = total_trials_per_param
+            while remaining > 0:
+                this_batch = min(batch_size, remaining)
+                remaining -= this_batch
+                seed = random.randint(0, 2**31 - 1)
+                fut = executor.submit(worker_task, param, this_batch, seed)
+                futures.append(fut)
+
+        for fut in as_completed(futures):
+            param, P_candidate, h_candidate = fut.result()
+            if P_candidate is None:
+                continue
+            current_best = best_mheights.get(param, float("inf"))
+            if h_candidate < current_best:
+                print(f"Improved (random) for {param}: {current_best:.6g} → {h_candidate:.6g}")
+                best_mheights[param] = float(h_candidate)
+                best_generators[param] = P_candidate
+                save_state(best_generators, best_mheights)
+
+    # === LOCAL IMPROVEMENT PHASE (parallel neighbors inside each param) ===
+    print("\n=== Starting local improvement phase (identity check + parallel ±1) ===")
+    for param in PARAMS:
+        if param not in best_generators:
+            continue
+        n, k, m = param
+        print(f"Local improvement for {param} (current h_m = {best_mheights[param]:.6g}) ...")
+        P_improved, h_improved = local_improve(
+            best_generators[param], n, k, m
+        )
+        if h_improved < best_mheights[param]:
+            print(f"  Improved {param}: {best_mheights[param]:.6g} → {h_improved:.6g}")
+            best_generators[param] = P_improved
+            best_mheights[param] = h_improved
+            save_state(best_generators, best_mheights)
+        else:
+            print(f"  No further improvement for {param}")
+
+    print("Search + local improvement finished.")
+    print("Best m-heights found:")
+    for param in sorted(best_mheights.keys()):
+        print(f"  {param}: h_m = {best_mheights[param]:.6g}")
+
+
 if __name__ == "__main__":
-    gen_file = "generatorMatrixTemp"
-    mh_file = "mHeightTemp"
-
-    # Load previous best results (or start fresh)
-    if os.path.exists(gen_file):
-        with open(gen_file, "rb") as f:
-            generator_dict = pickle.load(f)
-        print(f"✅ Loaded existing generatorMatrix ({len(generator_dict)} entries)")
-    else:
-        generator_dict = {}
-        print("ℹ️  No generatorMatrix found → starting fresh")
-
-    if os.path.exists(mh_file):
-        with open(mh_file, "rb") as f:
-            mHeight_dict = pickle.load(f)
-        print(f"✅ Loaded existing mHeight ({len(mHeight_dict)} entries)")
-    else:
-        mHeight_dict = {}
-        print("ℹ️  No mHeight found → starting fresh")
-
-    # All required parameter sets
-    params = [
-        (9, 4, 2), (9, 4, 3), (9, 4, 4), (9, 4, 5),
-        (9, 5, 2), (9, 5, 3), (9, 5, 4),
-        (9, 6, 2), (9, 6, 3),
-    ]
-
-    num_workers = cpu_count()
-    batch_size = num_workers * 8          # high throughput
-    print(f"🚀 Starting continuous parallel search with {num_workers} cores")
-    print(f"   Batch size = {batch_size} candidates per parameter set (random + hill-climbing)")
-
-    trial_counter = 0
-
-    with Pool(processes=num_workers) as pool:
-        try:
-            while True:                                      # ← continuous forever
-                for n, k, m in params:
-                    key = (n, k, m)
-                    current_best_h = mHeight_dict.get(key, float("inf"))
-                    current_best_P = generator_dict.get(key)
-
-                    print(f"\n🔄 Batch {trial_counter:,} | {n},{k},{m} | best so far = {current_best_h:.8f}")
-
-                    # Decide how many hill-climb vs random (bias toward hill-climb once we have a good matrix)
-                    hill_prob = 0.65 if current_best_P is not None else 0.0
-
-                    args_list = []
-                    for i in range(batch_size):
-                        seed = trial_counter * batch_size + i
-                        if np.random.rand() < hill_prob:
-                            base_P = current_best_P.copy()
-                        else:
-                            base_P = None
-                        args_list.append((n, k, m, seed, base_P))
-
-                    # PARALLEL evaluation
-                    results = pool.map(worker, args_list)
-
-                    improved = False
-                    for P_cand, h_cand in results:
-                        if 1.0 <= h_cand < current_best_h:   # strictly better
-                            current_best_h = h_cand
-                            current_best_P = P_cand.copy()
-                            generator_dict[key] = current_best_P
-                            mHeight_dict[key] = current_best_h
-
-                            # Immediate save
-                            with open(gen_file, "wb") as f:
-                                pickle.dump(generator_dict, f)
-                            with open(mh_file, "wb") as f:
-                                pickle.dump(mHeight_dict, f)
-
-                            print(f"🎉 NEW BEST for {key} → h_m = {current_best_h:.8f}")
-                            improved = True
-
-                    if improved:
-                        print(f"   → Pickles updated with improved matrix for {key}")
-
-                    trial_counter += 1
-
-        except KeyboardInterrupt:
-            print("\n\n🛑 Ctrl+C received – saving current best results before exit...")
-            # Final save (in case the very last batch had no improvement)
-            with open(gen_file, "wb") as f:
-                pickle.dump(generator_dict, f)
-            with open(mh_file, "wb") as f:
-                pickle.dump(mHeight_dict, f)
-            print("✅ All best generator matrices and m-heights saved.")
-            print("   You can restart the script anytime – it will resume from these bests.")
-            sys.exit(0)
-
-    # (This line is unreachable because of the infinite loop + Ctrl+C handler)
+    main(
+        total_trials_per_param=10000,
+        workers=None,
+        batch_size=10,
+    )
