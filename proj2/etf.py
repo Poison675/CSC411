@@ -172,51 +172,6 @@ def approximate_etf(n: int, k: int, tol: float = 1e-9, max_iter: int = 2000,
     return vectors
 
 
-def find_best_etf(n: int, k: int, trials: int = 1000, max_iter: int = 1500,
-                  tol: float = 1e-9) -> tuple[np.ndarray, float]:
-    """
-    Run approximate_etf many times and return the best one based on a combined score:
-      - Low tightness error (frame operator close to (n/k)I)
-      - Low variance of the absolute off-diagonal inner products (more equiangular)
-    
-    Returns (best_vectors, best_score)
-    """
-    best_vectors = None
-    best_score = np.inf
-
-    print(f"Searching for best approximate ETF (n={n}, k={k}) over {trials} trials...")
-
-    for i in range(trials):
-        seed = i + 42  # reproducible but varied
-        vectors = approximate_etf(n, k, tol=tol, max_iter=max_iter, random_state=seed)
-
-        # Compute quality metrics
-        frame_op = vectors.T @ vectors
-        target = (n / k) * np.eye(k)
-        tightness_err = np.linalg.norm(frame_op - target, ord='fro')
-
-        gram = vectors @ vectors.T
-        off_diag = np.abs(gram - np.eye(n))
-        min_dist = np.min(off_diag[np.triu_indices(n, k=1)])
-
-        if min_dist < 0.01:   # too close → bad solution
-            score = np.inf
-        else:
-            tightness_err = np.linalg.norm(vectors.T @ vectors - (n/k)*np.eye(k), 'fro')
-            equi_std = off_diag[np.triu_indices(n, k=1)].std()
-            score = tightness_err + 100.0 * equi_std + 1000.0 * (0.05 - min_dist if min_dist < 0.05 else 0)
-
-        if score < best_score:
-            best_score = score
-            best_vectors = vectors.copy()
-
-        if (i + 1) % 200 == 0 or i == 0:
-            print(f"  Trial {i+1:4d}/{trials} | current best score: {best_score:.6f}")
-
-    print(f"Finished. Best score: {best_score:.6f}\n")
-    return best_vectors, best_score
-
-
 # ====================== Verification ======================
 def verify_etf(vectors: np.ndarray, name: str = ""):
     n, k = vectors.shape
@@ -301,11 +256,9 @@ def main():
     n = 9
     k = 4
 
-    nonIvectors, best_score = find_best_etf(n, k, trials=1000, max_iter=2000)
+    nonIvectors = approximate_etf(n, k, )
 
     verify_etf(nonIvectors, f"Best Approximate ETF (n={n}, k={k})")
-    print(f"Best combined score: {best_score:.6f}\n")
-
     display(nonIvectors.T)
     print('\n')
 
