@@ -3,7 +3,7 @@ import random
 import numpy as np
 from itertools import combinations
 from scipy.optimize import linprog
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 
 # =============================================================================
 # m-HEIGHT COMPUTATION (exact, for final evaluation)
@@ -30,7 +30,61 @@ def m_height(G: np.ndarray, m: int) -> float:
 
 
 # =============================================================================
-# ANGLE-BASED COST (the criterion you asked for)
+# NORMALIZE + SCALE TO CLOSEST SMALL INTEGER APPROXIMATION
+# (applied to EVERY candidate P before any testing/evaluation)
+# =============================================================================
+def normalize_and_approximate_P(P_in: np.ndarray, target_scale: float = 10.0) -> np.ndarray:
+    """
+    BEFORE TESTING ANY P:
+      - Normalize each column of P to unit length.
+      - Scale by target_scale.
+      - Round to nearest integer.
+      - Clip to [-100, 100].
+      - Guarantee no all-zero column (retry random direction if needed).
+    This turns any P (random or user-seeded) into its "closest small-integer
+    direction approximation".
+    """
+    P = P_in.astype(float).copy()
+    k, p_dim = P.shape
+
+    for j in range(p_dim):
+        col = P[:, j]
+        norm = np.linalg.norm(col)
+        if norm < 1e-12:  # degenerate column
+            # replace with random non-zero direction
+            col = np.random.randn(k)
+            norm = np.linalg.norm(col)
+        col_norm = col / norm
+        col_scaled = col_norm * target_scale
+        P[:, j] = np.round(col_scaled)
+
+    P = np.clip(P, -100, 100).astype(int)
+
+    # Final safety: no zero columns
+    for j in range(p_dim):
+        while np.all(P[:, j] == 0):
+            col = np.random.randn(k)
+            col_norm = col / np.linalg.norm(col)
+            col_scaled = col_norm * target_scale
+            P[:, j] = np.round(np.clip(col_scaled, -100, 100)).astype(int)
+    return P
+
+
+# =============================================================================
+# RANDOM P GENERATOR (now uses normalization + integer approximation)
+# =============================================================================
+def generate_random_P(k: int, p_dim: int, target_scale: float = 10.0) -> np.ndarray:
+    """Generate a fresh random direction matrix, then immediately normalize+approximate."""
+    while True:
+        # Gaussian random directions (better isotropic sampling than uniform)
+        P_float = np.random.randn(k, p_dim)
+        P = normalize_and_approximate_P(P_float, target_scale)
+        if np.all(np.any(P != 0, axis=0)):
+            return P
+
+
+# =============================================================================
+# ANGLE-BASED COST (purely directional, invariant to column scaling)
 # =============================================================================
 def angle_based_cost(G: np.ndarray, m: int) -> float:
     n = G.shape[1]
@@ -42,7 +96,7 @@ def angle_based_cost(G: np.ndarray, m: int) -> float:
     for i in range(n):
         other_mask = np.arange(n) != i
         ang_to_others = ang_matrix[i, other_mask]
-        closest_rel = np.argsort(ang_to_others)[:m-1]
+        closest_rel = np.argsort(ang_to_others)[:m - 1] if m > 1 else []
         other_indices = np.where(other_mask)[0]
         subset_idx = [i] + list(other_indices[closest_rel])
 
@@ -54,12 +108,11 @@ def angle_based_cost(G: np.ndarray, m: int) -> float:
 
 
 # =============================================================================
-# LOCAL IMPROVEMENT (greedy ±1 on angle cost)
+# LOCAL IMPROVEMENT (±1 greedy on angle cost)
 # =============================================================================
 def local_improve_angle(P: np.ndarray, m: int) -> np.ndarray:
     P = P.copy().astype(int)
     k, p_dim = P.shape
-    n = k + p_dim
 
     G = np.hstack([np.eye(k), P.astype(float)])
     current_cost = angle_based_cost(G, m)
@@ -92,6 +145,42 @@ def local_improve_angle(P: np.ndarray, m: int) -> np.ndarray:
 
 
 # =============================================================================
+# SEED DICTIONARY (YOUR CUSTOM STARTING MATRICES GO HERE)
+# =============================================================================
+# Format: key = (n, k, m), value = k × (n-k) integer NumPy array
+# These will be normalized+approximated BEFORE testing (as requested).
+SEEDS: Dict[Tuple[int, int, int], np.ndarray] = {
+    # === ADD YOUR OWN SEEDS HERE (examples only) ===
+    # (9, 4, 2): np.array([[1, 2, 0, 3, 4],
+    #                      [0, 1, -2, 5, -1],
+    #                      [3, -1, 4, 0, 2],
+    #                      [2, 0, 1, -3, 5]], dtype=int),
+    #
+    # (9, 5, 3): np.array([[...], ...]),
+    # ...
+    # If a key is missing, we skip seeding for that parameter set.
+    (9, 4, 2): np.array([
+                [1, 0, 0, 0, 1],
+                [0, 1, 0, 0, 0],
+                [0, 0, 1, 0, 0],
+                [0, 0, 0, 1, 0],
+            ], dtype=float),
+    (9, 4, 3): np.array([
+                [1, 1, 1, 1,-1],
+                [1, 1, 1,-1, 1],
+                [1, 1,-1, 1, 1],
+                [1,-1, 1, 1, 1],
+            ], dtype=float),
+    (9, 4, 4): np.array([
+                [1, 1, 1, 1,-1],
+                [1, 1, 1,-1, 1],
+                [1, 1,-1, 1, 1],
+                [1,-1, 1, 1, 1],
+            ], dtype=float),
+}
+
+
+# =============================================================================
 # PARAMETERS & MAIN LOOP
 # =============================================================================
 PARAMS = [
@@ -100,9 +189,8 @@ PARAMS = [
     (9, 6, 2), (9, 6, 3),
 ]
 
-TRIALS_PER_PARAM = 10000          # ← increase for better quality (slower)
-LOW = -10
-HIGH = 10
+TRIALS_PER_PARAM = 10000          # increase for better quality
+TARGET_SCALE = 10.0               # scale used for normalization+rounding
 
 
 def main():
@@ -110,32 +198,46 @@ def main():
     best_mheights: Dict[Tuple[int, int, int], float] = {}
 
     print(f"Starting search for {len(PARAMS)} parameter sets "
-          f"({TRIALS_PER_PARAM} random trials each + local improvement)\n")
+          f"({TRIALS_PER_PARAM} random trials each + local improvement)\n"
+          f"Normalization + small-integer approximation (scale={TARGET_SCALE}) "
+          f"applied to EVERY P before testing.\n")
 
     for n, k, m in PARAMS:
         p_dim = n - k
-        print(f"\n{'='*70}")
+        print(f"\n{'='*80}")
         print(f"Processing (n={n}, k={k}, m={m})  →  P is {k}×{p_dim}")
-        print(f"{'='*70}")
+        print(f"{'='*80}")
 
         best_cost = float('inf')
-        best_P = None
-        best_h = None
+        best_P: Optional[np.ndarray] = None
+        best_h: Optional[float] = None
 
-        # Random search phase
+        # 1. Try user-seeded matrix (if provided)
+        if (n, k, m) in SEEDS:
+            seed_P_raw = SEEDS[(n, k, m)].copy()
+            # === APPLY NORMALIZE + APPROXIMATE BEFORE TESTING ===
+            seed_P = normalize_and_approximate_P(seed_P_raw, TARGET_SCALE)
+            G_seed = np.hstack([np.eye(k), seed_P.astype(float)])
+            seed_cost = angle_based_cost(G_seed, m)
+
+            print(f"  Using SEEDED P (after normalization/approx) → angle-cost = {seed_cost:.4f}")
+            best_P = seed_P
+            best_cost = seed_cost
+            try:
+                best_h = m_height(G_seed, m)
+                print(f"    Exact m-height of seed = {best_h:.6f}")
+            except Exception:
+                best_h = None
+
+        # 2. Random search phase (every random P also normalized+approximated)
         for trial in range(TRIALS_PER_PARAM):
-            # Random integer P with no all-zero columns
-            while True:
-                P = np.random.randint(LOW, HIGH + 1, size=(k, p_dim))
-                if np.all(np.any(P != 0, axis=0)):
-                    break
-
-            G = np.hstack([np.eye(k), P.astype(float)])
+            P_raw = generate_random_P(k, p_dim, TARGET_SCALE)   # already normalized
+            G = np.hstack([np.eye(k), P_raw.astype(float)])
             cost = angle_based_cost(G, m)
 
             if cost < best_cost:
                 best_cost = cost
-                best_P = P.copy()
+                best_P = P_raw.copy()
 
                 try:
                     h = m_height(G, m)
@@ -146,31 +248,32 @@ def main():
                 print(f"  Trial {trial+1:4d}/{TRIALS_PER_PARAM} | "
                       f"angle-cost = {cost:.4f} rad | m-height = {best_h:.6f}")
 
-        # Local improvement phase
+        # 3. Local improvement on the overall best so far
         if best_P is not None:
-            print(f"\n  Running local ±1 improvement on angle cost...")
+            print(f"\n  Running local ±1 improvement on best P...")
             best_P = local_improve_angle(best_P, m)
             G_final = np.hstack([np.eye(k), best_P.astype(float)])
             best_cost = angle_based_cost(G_final, m)
             best_h = m_height(G_final, m)
-            print(f"  Final after local improve → angle-cost = {best_cost:.4f} rad | m-height = {best_h:.6f}")
+            print(f"  Final after local improve → angle-cost = {best_cost:.4f} rad | "
+                  f"m-height = {best_h:.6f}")
 
-        # Store results
+        # Store results (P is already integer, normalized, no zero columns)
         best_generators[(n, k, m)] = best_P
         best_mheights[(n, k, m)] = float(best_h)
 
-    # Save final submission files (exactly as required by the project)
+    # Save exactly the files required by the project spec
     with open("generatorMatrix", "wb") as f:
         pickle.dump(best_generators, f)
 
     with open("mHeight", "wb") as f:
         pickle.dump(best_mheights, f)
 
-    print("\n" + "="*70)
+    print("\n" + "="*80)
     print("ALL DONE! Submission files created:")
     print("   • generatorMatrix")
     print("   • mHeight")
-    print("="*70)
+    print("="*80)
     print("Best m-heights found:")
     for key in sorted(best_mheights.keys()):
         print(f"   {key} → h_m = {best_mheights[key]:.6f}")

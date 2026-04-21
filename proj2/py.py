@@ -129,8 +129,8 @@ def local_improve(P: np.ndarray, n: int, k: int, m: int) -> Tuple[np.ndarray, fl
 # === SEARCH SPACE & PARALLEL DRIVER =========================
 # ============================================================
 
-GEN_PICKLE = "generatorMatrixMerge"
-MH_PICKLE = "mHeightMerge"
+GEN_PICKLE = "generatorMatrixTotalMerge"
+MH_PICKLE = "mHeightTotalMerge"
 
 PARAMS = [
     (9, 4, 2), (9, 4, 3), (9, 4, 4), (9, 4, 5),
@@ -162,7 +162,7 @@ def save_state(best_generators, best_mheights):
         pickle.dump(best_mheights, f)
 
 
-def random_P(k: int, n_minus_k: int, low: int = -5, high: int = 5) -> np.ndarray:
+def random_P(k: int, n_minus_k: int, low: int = -1, high: int = 1) -> np.ndarray:
     while True:
         P = np.random.randint(low, high + 1, size=(k, n_minus_k))
         if np.all(np.any(P != 0, axis=0)):

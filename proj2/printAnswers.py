@@ -46,9 +46,9 @@ def print_generator_matrices():
         return
 
     # Load the saved results
-    with open("generatorMatrixTempCp", "rb") as f:
+    with open("generatorMatrixTotalMerge", "rb") as f:
         generatorMatrix = pickle.load(f)
-    with open("mHeightTempCp", "rb") as f:
+    with open("mHeightTotalMerge", "rb") as f:
         mHeight = pickle.load(f)
 
     if not generatorMatrix:

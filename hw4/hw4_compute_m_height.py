@@ -1,145 +1,91 @@
 import pickle
 import numpy as np
-from itertools import combinations, product
+from itertools import combinations
 from scipy.optimize import linprog
-import multiprocessing as mp
-from functools import partial
-import time
+from typing import List, Tuple
+import time as t
+from concurrent.futures import ProcessPoolExecutor
+import os
 
-def _solve_one_lp(params):
-    """Worker function for one LP (picklable for multiprocessing)."""
-    c_obj, A_ub, b_ub, A_eq, b_eq = params
-    res = linprog(c_obj,
-                  A_ub=A_ub, b_ub=b_ub,
-                  A_eq=A_eq, b_eq=b_eq,
+
+# ================================================================
+# EXACT FUNCTIONS FROM THE PROJECT (unchanged)
+# ================================================================
+def _solve_lp(args):
+    """Solve one LPS,j linear program."""
+    G, j, barS = args
+    c = -G[:, j]                     # maximize g_j · u  =>  minimize -g_j · u
+    barS_matrix = G[:, barS].T
+    A_ub = np.vstack([barS_matrix, -barS_matrix])
+    b_ub = np.ones(2 * len(barS))
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub,
                   bounds=(None, None),
                   method='highs',
                   options={'presolve': True, 'disp': False})
-    if res.success:
-        return -res.fun
-    elif res.status == 3:   # unbounded
-        return 1.0
-    else:                   # infeasible
-        return 0.0
+    return -res.fun if res.success else np.inf
 
 
-def compute_m_height(G: np.ndarray, m: int, n: int, k: int) -> float:
-    """
-    Computes the exact m-height of the analog code with generator matrix G
-    using the LP-based algorithm described in the project document (Theorem 1).
-    """
+def m_height(G: np.ndarray, m: int) -> float:
+    """Exact m-height using the LP formulation (parallelized over all LPs)."""
+    n = G.shape[1]
     if m == 0:
         return 1.0
-
-    # Pre-build ALL LP instances (tiny memory footprint)
-    lp_instances = []
-    cols = range(n)
-    psi_values = list(product([-1.0, 1.0], repeat=m))
-
-    for a in cols:
-        for b in cols:
-            if b == a:
-                continue
-            remaining = [x for x in cols if x != a and x != b]
-            for X_tup in combinations(remaining, m - 1 if m > 1 else 0):
-                X = list(X_tup)
-                X_sorted = sorted(X)
-                Y_sorted = sorted(set(remaining) - set(X))
-                x_list = [a] + X_sorted + [b] + Y_sorted
-                tau_inv = {x_list[j]: j for j in range(n)}
-
-                for psi in psi_values:
-                    s0 = psi[0]
-                    c_obj = -s0 * G[:, a]
-
-                    A_ub_list, b_ub_list = [], []
-
-                    # X constraints
-                    for jj, j_col in enumerate(X_sorted):
-                        pos = tau_inv[j_col]
-                        s_j = psi[pos]
-                        row1 = s_j * G[:, j_col] - s0 * G[:, a]
-                        A_ub_list.append(row1)
-                        b_ub_list.append(0.0)
-                        row2 = -s_j * G[:, j_col]
-                        A_ub_list.append(row2)
-                        b_ub_list.append(-1.0)
-
-                    # Y constraints (|c_j| <= 1)
-                    for j_col in Y_sorted:
-                        A_ub_list.append(G[:, j_col])
-                        b_ub_list.append(1.0)
-                        A_ub_list.append(-G[:, j_col])
-                        b_ub_list.append(1.0)
-
-                    A_ub = np.array(A_ub_list, dtype=np.float64)
-                    b_ub = np.array(b_ub_list, dtype=np.float64)
-                    A_eq = np.array([G[:, b]], dtype=np.float64)
-                    b_eq = np.array([1.0], dtype=np.float64)
-
-                    lp_instances.append((c_obj, A_ub, b_ub, A_eq, b_eq))
-
-    # Parallel solve on all CPU cores
-    num_workers = max(1, mp.cpu_count())
-    print(f"   Solving {len(lp_instances):,} LPs with {num_workers} CPU workers...")
-
-    with mp.Pool(processes=num_workers) as pool:
-        results = pool.map(_solve_one_lp, lp_instances)
-
-    hm = max(results) if results else 1.0
-    return max(hm, 1.0)
+    # All tasks: (G, j, barS) for every S of size m and every j in S
+    tasks = [(G, j, [t for t in range(n) if t not in S])
+             for S in combinations(range(n), m) for j in S]
+    # Parallel execution (safe because each LP is independent)
+    with ProcessPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+        results = list(executor.map(_solve_lp, tasks))
+    return max(max(results), 1.0)
 
 
-# ====================== MAIN ======================
-# print("Loading HW-4-n_k_m_P ...")
-# with open('HW-4-n_k_m_P', 'rb') as f:
-#     data = pickle.load(f)
+# ================================================================
+# LOAD THE TWO SAMPLE FILES
+# ================================================================
+with open("CSCE-411-Project-sample-n_k_m_P", "rb") as f:
+    samples = pickle.load(f)          # list of [n, k, m, P]
 
-# print(f"Loaded {len(data)} samples. Starting m-height computation...\n")
+with open("CSCE-411-Project-sample-mHeights", "rb") as f:
+    stored_heights = pickle.load(f)   # list of corresponding m-heights
 
-# m_heights = []
-# for idx, item in enumerate(data):
-#     n, k, m, P = item
-#     # Build systematic generator matrix G = [I_k | P]
-#     I = np.eye(k, dtype=float)
-#     G = np.hstack((I, P.astype(float)))
+print(f"Loaded {len(samples)} sample matrices and {len(stored_heights)} stored heights.\n")
 
-#     print(f"[{idx+1:4d}/{len(data)}]  n={n} k={k} m={m}  shape={G.shape}")
-#     h = compute_m_height(G, m, n, k)
-#     m_heights.append(h)
-#     print(f"    -> m-height = {h:.10f}\n")
+# ================================================================
+# VERIFY EACH SAMPLE
+# ================================================================
+s_time = t.perf_counter()
+i = 0
+all_match = True
+for idx, (sample, stored_h) in enumerate(zip(samples, stored_heights)):
+    n, k, m, P = sample
+    
+    # Build the full systematic generator matrix G = [I_k | P]
+    I = np.eye(k, dtype=float)
+    G = np.concatenate([I, P.astype(float)], axis=1)
+    
+    # Compute m-height using the official functions
+    computed_h = m_height(G, m)
+    
+    # Check if they are essentially equal (floating-point tolerance)
+    match = np.isclose(computed_h, stored_h, rtol=1e-8, atol=1e-10)
+    
+    status = "✅ MATCH" if match else "❌ MISMATCH"
+    if not match:
+        all_match = False
+    
+    print(f"Sample {idx:2d}  (n={n}, k={k}, m={m}) "
+          f"→ computed = {computed_h:.10f}  |  stored = {stored_h:.10f}  → {status}")
+    if i == 100:
+        e_time = t.perf_counter()
+        print(f'\n\nTIME: {e_time - s_time: 0.3f}')
+        break
+    i += 1
 
-# # Save the result
-# with open('HW-4-mHeightsTEMP', 'wb') as f:
-#     pickle.dump(m_heights, f)
-
-# print("All done! File 'HW-4-mHeightsTEMP' created successfully.")
-
-if __name__ == "__main__":
-    print("Loading generatorMatrix file...")
-    with open("generatorMatrixTEMP", "rb") as f:
-        generatorMatrix = pickle.load(f)
-
-    print(f"Loaded {len(generatorMatrix)} generator matrices.\n")
-
-    mHeight = {}
-
-    # Process each stored matrix
-    for idx, (key, P) in enumerate(sorted(generatorMatrix.items()), 1):
-        n, k, m = key
-        print(f"[{idx:4d}/{len(generatorMatrix)}]  n={n} k={k} m={m}  shape={P.shape}")
-
-        # Build systematic generator matrix G = [I_k | P]
-        I = np.eye(k, dtype=float)
-        G = np.hstack((I, P.astype(float)))
-
-        h = compute_m_height(G, m, n, k)
-        mHeight[key] = float(h)
-        print(f"    -> m-height = {h:.10f}\n")
-
-    # ====================== SAVE EXACTLY AS PROJECT REQUIRES ======================
-    with open("mHeight", "wb") as f:
-        pickle.dump(mHeight, f)
-
-    print("✅ DONE! File 'mHeight' has been created with verified values.")
-    print("   You can now submit 'generatorMatrix' and 'mHeight'.")
+print("\n" + "="*80)
+if all_match:
+    print("✅ ALL SAMPLES VERIFIED SUCCESSFULLY")
+    print("   The provided m-heights exactly match the official computation.")
+else:
+    print("❌ SOME MISMATCHES FOUND")
+    print("   Check the printed lines above for details.")
+print("="*80)

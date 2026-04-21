@@ -76,7 +76,7 @@ def evaluate_candidate(args):
     G = np.hstack((I, P.astype(float)))
     
     # Compute m-height
-    h = compute_m_height(G, m)
+    h = m_height(G, m)
     return P, h
 
 
@@ -99,7 +99,7 @@ else:
     generatorMatrix = {}
     mHeight = {}
 
-print("\nStarting stable parallel search (broadcasting bug fixed)...\n")
+print("\nStarting stable parallel search...\n")
 
 for _ in range(10):
     for n, k, m in params_list:
