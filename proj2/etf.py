@@ -5,7 +5,7 @@ from itertools import combinations
 from typing import Dict, Tuple
 
 import numpy as np
-from scipy.optimize import linprog, minimize
+from scipy.optimize import linprog, minimize, minimize_scalar
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
@@ -36,6 +36,77 @@ def m_height(G: np.ndarray, m: int) -> float:
         results = list(executor.map(_solve_lp, tasks))
     return max(max(results), 1.0)
 
+# ============================================================
+# === LOCAL IMPROVEMENT HELPERS ==============================
+# ============================================================
+
+def create_identity_rows_P(k: int, n_minus_k: int) -> np.ndarray:
+    """Candidate where every column is a single 1 in a cycling row."""
+    P = np.zeros((k, n_minus_k), dtype=int)
+    for col in range(n_minus_k):
+        row = col % k
+        P[row, col] = 1
+    return P
+
+
+def build_systematic_G(k: int, n: int, P: np.ndarray) -> np.ndarray:
+    """Build full generator matrix [I_k | P]."""
+    I = np.eye(k, dtype=float)
+    return np.concatenate([I, P.astype(float)], axis=1)
+
+
+def evaluate_neighbor(args: tuple) -> float:
+    """Worker for parallel neighbor evaluation."""
+    P_new, n, k, m = args
+    G_new = build_systematic_G(k, n, P_new)
+    return m_height(G_new, m)
+
+
+def local_improve(P: np.ndarray, n: int, k: int, m: int) -> Tuple[np.ndarray, float]:
+    """
+    1. First check the "matrix of all identity rows" candidate.
+    2. Then run greedy ±1 local search (parallel neighbors).
+    """
+    P = P.copy().astype(int)
+    current_h = m_height(build_systematic_G(k, n, P), m)
+    print(f'Best {m}_height at start of local improvement: {current_h}')
+
+    # Parallel greedy ±1 local search
+    iteration = 0
+    while True:
+        iteration += 1
+        neighbors = []
+        for i in range(k):
+            for j in range(n - k):
+                for delta in [-3, -2, -1, 1, 2, 3]:
+                    P_new = P.copy()
+                    P_new[i, j] += delta
+                    if np.all(P_new[:, j] == 0):
+                        continue
+                    neighbors.append((P_new, n, k, m))
+
+        if not neighbors:
+            break
+
+        num_workers = min(len(neighbors), os.cpu_count() or 4)
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            h_list = list(executor.map(evaluate_neighbor, neighbors))
+
+        best_h_new = current_h
+        best_P_new = None
+        for idx, h_new in enumerate(h_list):
+            if h_new < best_h_new:
+                best_h_new = h_new
+                best_P_new = neighbors[idx][0]
+
+        if best_P_new is None:
+            break
+
+        P = best_P_new
+        current_h = best_h_new
+        # print(f"  Local improve iter {iteration} → h_{m} = {current_h:.6g}")
+
+    return P, current_h
 
 
 def reduced_row_echelon_left_identity(A: np.ndarray, tol: float = 1e-10) -> np.ndarray:
@@ -252,30 +323,219 @@ def display(m: np.ndarray, decimals: int = 4, title: str = None) -> None:
     print("   " + "─" * (col_width * rounded.shape[1] + 4))
 
 
+def scale_to_closest_integers(matrix: np.ndarray, tol: float = 1e-10,
+                              max_abs_value: int = 100) -> np.ndarray:
+    """
+    Scale each column AFTER the first k columns so that it becomes
+    as close as possible to an integer vector, while ensuring that
+    all resulting integer entries satisfy |value| <= max_abs_value.
+
+    The function dynamically increases the search upper bound until
+    the optimized scaling factors keep the final integers safely
+    within [-max_abs_value, max_abs_value].
+
+    Parameters
+    ----------
+    matrix : np.ndarray
+        Shape (k, n) reduced matrix [I | B] (float).
+    tol : float
+        Tolerance for warning about large rounding residuals.
+    max_abs_value : int
+        Maximum allowed absolute value in the final integer matrix (default 100).
+
+    Returns
+    -------
+    np.ndarray (dtype=int)
+        Same shape with left k columns unchanged and right columns
+        converted to closest integers under the size constraint.
+    """
+    if matrix.ndim != 2:
+        raise ValueError("Input must be a 2D matrix")
+
+    k, n = matrix.shape
+    if k > n:
+        raise ValueError("Matrix must have at least as many columns as rows")
+
+    result = matrix.astype(float).copy()
+
+    # Start with a modest upper bound and increase if needed
+    upper_bound = 70.0
+    max_attempts = 20
+
+    for j in range(k, n):                     # only scale the non-identity columns
+        v = result[:, j]
+        abs_v_max = np.max(np.abs(v))
+
+        if abs_v_max < 1e-12:
+            # Degenerate column → leave as zero
+            result[:, j] = 0
+            continue
+
+        best_s = None
+        best_residual = np.inf
+        final_upper = upper_bound
+
+        for attempt in range(max_attempts):
+            def objective(s: float) -> float:
+                if s <= 0:
+                    return 1e30
+                scaled = s * v
+                nearest = np.round(scaled)
+                return np.sum((scaled - nearest) ** 2)
+
+            # Try optimization with current upper bound
+            res = minimize_scalar(
+                objective,
+                bounds=(0.01, final_upper),
+                method='bounded',
+                tol=1e-14
+            )
+
+            candidate_s = res.x
+            scaled = candidate_s * v
+            integer_col = np.round(scaled)
+            max_entry = np.max(np.abs(integer_col))
+
+            # Check if this scaling keeps values within limits
+            if max_entry <= max_abs_value:
+                # Good scaling found
+                best_s = candidate_s
+                best_residual = np.max(np.abs(scaled - integer_col))
+                break
+            else:
+                # Need larger range — the optimal s is likely near the boundary
+                final_upper *= 1.8   # increase by 80%
+                if attempt == max_attempts - 1:
+                    print(f"  Warning: Could not find scaling for column {j} "
+                          f"within |x| <= {max_abs_value} after {max_attempts} attempts.")
+                    # Fall back to the last tried scaling and clip
+                    best_s = candidate_s
+                    best_residual = np.max(np.abs(scaled - integer_col))
+
+        # Apply best scaling found
+        if best_s is None:
+            best_s = 1.0
+
+        scaled = best_s * v
+        integer_col = np.round(scaled)
+
+        # Final safety clip (should rarely trigger)
+        integer_col = np.clip(integer_col, -max_abs_value, max_abs_value)
+
+        # Quality check
+        # residual = np.max(np.abs(scaled - integer_col))
+        # if residual > tol:
+        #     print(f"  Warning: column {j} has max residual {residual:.2e} "
+        #           f"(scaling factor s = {best_s:.8f}, upper_bound used = {final_upper:.1f})")
+
+        result[:, j] = integer_col
+
+    return result.astype(int)
+
+
+# def main():
+#     n = 9
+#     k = 4
+#     m = 5
+
+#     nonIvectors = approximate_etf(n, k, )
+
+#     verify_etf(nonIvectors, f"Best Approximate ETF (n={n}, k={k})")
+#     display(nonIvectors.T)
+#     print('\n')
+
+#     result = reduced_row_echelon_left_identity(nonIvectors.T)
+#     for num in range(1, n-k+1):
+#         print(f'{num}_height of result: {m_height(result, num):>10f}')
+#         display(result)
+
+#     integer_matrix = scale_to_closest_integers(result)
+    
+#     print(f'\n\nAfter finding closest integer approximation:\n')
+
+#     for num in range(1, n-k+1):
+#         print(f'{num}_height of result: {m_height(integer_matrix, num):>10f}')
+#         display(integer_matrix, decimals=0)
+
+#     P = integer_matrix[:, k:]
+
+#     P, current_h = local_improve(P, n, k, m)
+
+#     G = build_systematic_G(k, n, P)
+
+#     print(f'Best {m}_height after local improvements: {current_h}')
+#     display(G, 0)
+
+# if __name__ == "__main__":
+#     main()
+
+
+# ====================== CONFIG ======================
+GEN_PICKLE = "generatorMatrixTotalMerge"
+MH_PICKLE = "mHeightTotalMerge"
+
+PARAMS = [
+    (9, 4, 2), (9, 4, 3), (9, 4, 4), (9, 4, 5),
+    (9, 5, 2), (9, 5, 3), (9, 5, 4),
+    (9, 6, 2), (9, 6, 3),
+]
+
+
+def load_state():
+    best_generators = pickle.load(open(GEN_PICKLE, "rb")) if os.path.exists(GEN_PICKLE) else {}
+    best_mheights = pickle.load(open(MH_PICKLE, "rb")) if os.path.exists(MH_PICKLE) else {}
+    return best_generators, best_mheights
+
+
+def save_state(best_generators, best_mheights):
+    with open(GEN_PICKLE, "wb") as f:
+        pickle.dump(best_generators, f)
+    with open(MH_PICKLE, "wb") as f:
+        pickle.dump(best_mheights, f)
+
+
 def main():
-    n = 9
-    k = 4
+    best_generators, best_mheights = load_state()
 
-    nonIvectors = approximate_etf(n, k, )
+    print("Starting search for better generator matrices...\n")
 
-    verify_etf(nonIvectors, f"Best Approximate ETF (n={n}, k={k})")
-    display(nonIvectors.T)
-    print('\n')
+    for n, k, m in PARAMS:
+        print(f"Processing parameter (n={n}, k={k}, m={m}) ...")
 
-    result = reduced_row_echelon_left_identity(nonIvectors.T)
-    for num in range(1, n-k+1):
-        # if num == n-k:
-        #     imitation_n = 3
-        #     result = approximate_etf(imitation_n, k, random_state=123)
-        #     result = reduced_row_echelon_left_identity(result.T)
+        nonIvectors = approximate_etf(n, k)
+        result = reduced_row_echelon_left_identity(nonIvectors.T)
+        integer_matrix = scale_to_closest_integers(result)
 
-        #     for i in range((n-imitation_n)//(imitation_n-k)):
-        #         result = duplicate_last_m_columns(result, (imitation_n-k))
-            
-        #     result = duplicate_last_m_columns(result, ((n-imitation_n)%(imitation_n-k)))
+        P = integer_matrix[:, k:]
+        P, current_h = local_improve(P, n, k, m)
+        G = build_systematic_G(k, n, P)
 
-        print(f'{num}_height of result: {m_height(result, num):>10f}')
-        display(result)
+        print(f'Best {m}_height after local improvements: {current_h}')
+        display(G, 0)
+
+        param_tuple = (n, k, m)
+        stored_h = best_mheights.get(param_tuple, float('inf'))
+
+        print(f"   Computed m={m}_height: {current_h:.8f}")
+
+        # === SAVE LOGIC ===
+        if current_h < stored_h:
+            print(f"   ✓ NEW BEST for {param_tuple}: {stored_h:.8f} → {current_h:.8f}")
+            best_generators[param_tuple] = result.copy()   # save the reduced matrix [I | B]
+            best_mheights[param_tuple] = float(current_h)
+            save_state(best_generators, best_mheights)
+        else:
+            print(f"   No improvement (stored best = {stored_h:.8f})")
+
+        print("-" * 60)
+
+    # Final summary
+    print("\n=== FINAL SUMMARY ===")
+    for param in sorted(best_mheights.keys()):
+        print(f"  {param}: best m_height = {best_mheights[param]:.8f}")
+
 
 if __name__ == "__main__":
+    random.seed(42)
+    np.random.seed(42)
     main()
