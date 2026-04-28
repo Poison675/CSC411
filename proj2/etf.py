@@ -471,8 +471,8 @@ def scale_to_closest_integers(matrix: np.ndarray, tol: float = 1e-10,
 
 
 # ====================== CONFIG ======================
-GEN_PICKLE = "generatorMatrixTotalMerge"
-MH_PICKLE = "mHeightTotalMerge"
+GEN_PICKLE = "generatorMatrixe"
+MH_PICKLE = "mHeighte"
 
 PARAMS = [
     (9, 4, 2), (9, 4, 3), (9, 4, 4), (9, 4, 5),

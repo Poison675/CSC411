@@ -175,8 +175,8 @@ def worker_task(param: Tuple[int, int, int], num_trials: int, seed: int = None):
 # === MAIN ===================================================
 # ============================================================
 
-GEN_PICKLE = "generatorMatrixTotalMerge"
-MH_PICKLE = "mHeightTotalMerge"
+GEN_PICKLE = "generatorMatrixe"
+MH_PICKLE = "mHeighte"
 
 PARAMS = [
     (9, 4, 2), (9, 4, 3), (9, 4, 4), (9, 4, 5),

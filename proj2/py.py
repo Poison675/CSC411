@@ -129,8 +129,8 @@ def local_improve(P: np.ndarray, n: int, k: int, m: int) -> Tuple[np.ndarray, fl
 # === SEARCH SPACE & PARALLEL DRIVER =========================
 # ============================================================
 
-GEN_PICKLE = "generatorMatrixTotalMerge"
-MH_PICKLE = "mHeightTotalMerge"
+GEN_PICKLE = "generatorMatrixe"
+MH_PICKLE = "mHeighte"
 
 PARAMS = [
     (9, 4, 2), (9, 4, 3), (9, 4, 4), (9, 4, 5),

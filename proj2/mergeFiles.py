@@ -14,6 +14,7 @@ SUBMISSIONS: List[Tuple[str, str]] = [
     ("generatorMatrixTemp", "mHeightTemp"),   # example: another run / different seed
     ("generatorMatrixTempCp", "mHeightTempCp"),
     ("generatorMatrix", "mHeight"),
+    ("generatorMatrixTotalMerge", "mHeightTotalMerge"),
     # ("another_gen.pickle", "another_mh.pickle"),
     # ... add more pairs as needed
 ]

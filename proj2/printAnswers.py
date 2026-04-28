@@ -40,7 +40,7 @@ def print_generator_matrices():
     - Sorted by (n, k, m) for easy reading.
     - Uses fixed-width formatting, clear borders, and rounded values.
     """
-    if not os.path.exists("generatorMatrixTempCp"):
+    if not os.path.exists("generatorMatrix"):
         print("❌ No 'generatorMatrix' file found in the current directory.")
         print("   Run the main hill-climbing search first to generate matrices.")
         return
