@@ -420,7 +420,7 @@ def scale_to_closest_integers(matrix: np.ndarray, tol: float = 1e-10,
         integer_col = np.round(scaled)
 
         # Final safety clip (should rarely trigger)
-        integer_col = np.clip(integer_col, -max_abs_value, max_abs_value)
+        integer_col = np.clip(integer_col, -max_abs_value/2, max_abs_value/2)
 
         # Quality check
         # residual = np.max(np.abs(scaled - integer_col))
